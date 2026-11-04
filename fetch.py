@@ -4,14 +4,20 @@ Baja las cotizaciones del Radar de Mercado y escribe datos.json.
 
 POR QUÉ ESTO VIVE EN GITHUB Y NO EN LA NUBE DE CLAUDE
 El contenedor donde corren las tareas programadas no alcanza ninguna
-fuente de precios: Yahoo, CoinGecko, Stooq, Banxico y los proveedores de
-divisas devuelven cero. Lo único que responde es GitHub. Así que la
-descarga se hace aquí, en los servidores de GitHub, que sí tienen
-internet abierto, y el resultado queda en un archivo que la tarea de la
-nube lee por raw.githubusercontent.com.
+fuente de precios. Lo único que responde es GitHub. Así que la descarga
+se hace aquí, en sus servidores, y el resultado queda en un archivo que
+la tarea de la nube lee por raw.githubusercontent.com.
 
-Antes esto dependía de que la Mac de Víctor estuviera encendida a las
-8:47. Ya no.
+POR QUÉ LOS ETF NO SALEN DE YAHOO
+La primera versión usaba Yahoo Finance y falló en los quince símbolos
+con «429 Too Many Requests» — no por ritmo, sino porque Yahoo rechaza de
+plano las peticiones que vienen de centros de datos, y los servidores de
+GitHub lo son. Desde la Mac de Víctor funcionaba por ser IP residencial.
+La fuente pasó a Stooq, que sirve CSV sin credenciales y no discrimina
+por origen. Yahoo queda de respaldo por si algún día responde.
+
+CoinGecko sí funciona desde GitHub: los diecisiete criptos entraron a la
+primera. Esa parte no se toca.
 
 SALIDA
 El formato es el que espera radar_actualiza.py, ni uno más:
@@ -77,42 +83,103 @@ def baja(url, intentos=4):
     raise ultimo
 
 
-def una_referencia(tk):
+def csv_stooq(tk):
+    """Barras semanales de Stooq. CSV plano: Date,Open,High,Low,Close,Volume.
+
+    El máximo y el mínimo de 52 semanas salen de las columnas High y Low,
+    que es la definición correcta —extremos intradía—, no del cierre.
+    """
+    hoy = datetime.now(timezone.utc).date()
+    d1 = (hoy - timedelta(days=380)).strftime("%Y%m%d")
+    url = (f"https://stooq.com/q/d/l/?s={tk.lower()}.us&i=w"
+           f"&d1={d1}&d2={hoy.strftime('%Y%m%d')}")
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        texto = r.read().decode("utf-8", "replace")
+
+    lineas = [l for l in texto.strip().splitlines() if l.strip()]
+    if not lineas or not lineas[0].lower().startswith("date"):
+        raise ValueError(f"Stooq no devolvió datos para {tk} ({lineas[:1]})")
+
+    fechas, alto, bajo, cierre = [], [], [], []
+    for l in lineas[1:]:
+        c = l.split(",")
+        if len(c) < 5 or "N/D" in l:
+            continue
+        try:
+            h, b, ci = float(c[2]), float(c[3]), float(c[4])
+        except ValueError:
+            continue
+        fechas.append(datetime.strptime(c[0], "%Y-%m-%d")
+                      .replace(tzinfo=timezone.utc))
+        alto.append(h); bajo.append(b); cierre.append(ci)
+
+    if len(cierre) < 20:
+        raise ValueError(f"{tk}: sólo {len(cierre)} semanas, insuficiente")
+
+    # Las últimas 52 semanas, que es la ventana que describe el radar.
+    alto, bajo = alto[-52:], bajo[-52:]
+    return {"precio": cierre[-1], "min52": min(bajo), "max52": max(alto),
+            "cierres": cierre[-52:],
+            "d": int(fechas[-52:][0].timestamp()),
+            "h": int(fechas[-1].timestamp())}
+
+
+def yahoo(tk):
+    """Respaldo. Rechaza las IP de centros de datos con 429, así que hoy
+    casi nunca contesta desde GitHub; se conserva por si eso cambia."""
     d = baja("https://query1.finance.yahoo.com/v8/finance/chart/"
              f"{tk}?range=1y&interval=1wk")
     res = d["chart"]["result"][0]
     meta, ts = res["meta"], res["timestamp"]
-    cierres = [c for c in res["indicators"]["quote"][0]["close"] if c is not None]
-    if not cierres:
+    c = [x for x in res["indicators"]["quote"][0]["close"] if x is not None]
+    if not c:
         raise ValueError(f"{tk}: la serie vino vacía")
+    return {"precio": meta["regularMarketPrice"],
+            "min52": meta["fiftyTwoWeekLow"], "max52": meta["fiftyTwoWeekHigh"],
+            "cierres": c, "d": ts[0], "h": ts[-1]}
 
-    precio = meta["regularMarketPrice"]
-    mn, mx = meta["fiftyTwoWeekLow"], meta["fiftyTwoWeekHigh"]
+
+def una_referencia(tk):
+    """Stooq primero; Yahoo sólo si Stooq falla. Devuelve además de qué
+    fuente salió, para que el registro de la corrida lo diga y no haya
+    que deducirlo."""
+    errores = []
+    for nombre, fn in (("stooq", csv_stooq), ("yahoo", yahoo)):
+        try:
+            d = fn(tk)
+            break
+        except Exception as e:                      # noqa: BLE001
+            errores.append(f"{nombre}: {type(e).__name__} {e}")
+    else:
+        raise RuntimeError(" | ".join(errores))
+
+    precio, mn, mx, cierres = d["precio"], d["min52"], d["max52"], d["cierres"]
     for v, nom in ((precio, "precio"), (mn, "mínimo"), (mx, "máximo")):
         if not isinstance(v, (int, float)) or v <= 0:
             raise ValueError(f"{tk}: {nom} inservible ({v!r})")
     if mn >= mx:
         raise ValueError(f"{tk}: el mínimo no puede ser mayor que el máximo")
 
-    # Control de sanidad: si el precio de meta y el último cierre semanal
-    # se separan más de 2%, una de las dos lecturas viene rezagada y la
-    # fila se marca. Marcarlo es mejor que elegir en silencio.
+    # Control de sanidad: si el precio y el último cierre semanal se
+    # separan más de 2%, una de las dos lecturas viene rezagada y la fila
+    # se marca. Marcarlo es mejor que elegir en silencio.
     desvio = abs(precio / cierres[-1] - 1) * 100
     ref = {"precio": round(precio, 2), "min52": round(mn, 2),
            "max52": round(mx, 2), "sello": sello() + " cierre"}
     if desvio > 2:
         ref["desvio"] = round(desvio, 1)
-    serie = {"d": ts[0], "h": ts[-1], "c": [round(c, 2) for c in cierres]}
-    return ref, serie
+    serie = {"d": d["d"], "h": d["h"], "c": [round(c, 2) for c in cierres]}
+    return ref, serie, nombre
 
 
 def referencias(previo):
     refs, series, fallos = {}, {}, []
     for tk in SIMBOLOS:
         try:
-            refs[tk], series[tk] = una_referencia(tk)
+            refs[tk], series[tk], fuente = una_referencia(tk)
             print(f"  {tk:5} {refs[tk]['precio']:>10,.2f}"
-                  f"   {len(series[tk]['c']):>3} semanas"
+                  f"   {len(series[tk]['c']):>3} semanas   {fuente}"
                   + ("   ⚠ desvío" if "desvio" in refs[tk] else ""))
         except Exception as e:                      # noqa: BLE001
             # Se arrastra el valor de la corrida anterior CON SU SELLO
