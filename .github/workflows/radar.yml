@@ -1,0 +1,39 @@
+name: Radar · cotizaciones
+
+on:
+  schedule:
+    - cron: '10 14 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: radar
+  cancel-in-progress: false
+
+jobs:
+  cotizaciones:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Bajar cotizaciones
+        run: python3 fetch.py
+
+      - name: Guardar si cambió
+        run: |
+          git config user.name  "Radar Yaxché"
+          git config user.email "radar@users.noreply.github.com"
+          if git diff --quiet datos.json; then
+            echo "Sin cambios: no se guarda."
+          else
+            git add datos.json
+            git commit -m "Cotizaciones $(date -u '+%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
